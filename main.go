@@ -24,7 +24,7 @@ func NewBoshClient(boshURL, boshAdminUsername, boshAdminPassword string) *BoshCl
 		boshURL:           boshURL,
 		boshAdminUsername: boshAdminUsername,
 		boshAdminPassword: boshAdminPassword,
-		httpClient:        herottp.New(herottp.Config{NoFollowRedirect: true}),
+		httpClient:        herottp.New(herottp.Config{NoFollowRedirect: true, DisableTLSCertificateVerification: true}),
 	}
 }
 
@@ -51,7 +51,9 @@ func (c *BoshClient) ListDeployments(self string) []string {
 
 	var deploymentNames []string
 	for _, deployment := range deployments {
-		deploymentNames = append(deploymentNames, deployment.Name)
+		if deployment.Name != self {
+			deploymentNames = append(deploymentNames, deployment.Name)
+		}
 	}
 
 	return deploymentNames
@@ -81,7 +83,7 @@ func main() {
 		deployments := boshClient.ListDeployments(*thisDeployment)
 		log.Printf("Deployments: %+v\n", deployments)
 
-		time.Sleep(time.Minute)
+		time.Sleep(time.Second * 10)
 	}
 }
 
