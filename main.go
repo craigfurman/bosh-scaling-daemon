@@ -7,12 +7,13 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
-	"math/rand"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/craigfurman/herottp"
+	"github.com/garyburd/redigo/redis"
 	"gopkg.in/yaml.v2"
 )
 
@@ -115,6 +116,10 @@ func (c *BoshClient) Deploy(manifest Manifest) {
 	mustNot(err)
 	req.Header.Set("Content-Type", "text/yaml")
 	req.SetBasicAuth(c.boshAdminUsername, c.boshAdminPassword)
+	c.PerformAsyncReqestAndAwaitEndOfTask(req)
+}
+
+func (c *BoshClient) PerformAsyncReqestAndAwaitEndOfTask(req *http.Request) string {
 	resp, err := c.httpClient.Do(req)
 	mustNot(err)
 
@@ -127,20 +132,54 @@ func (c *BoshClient) Deploy(manifest Manifest) {
 
 	locationComponents := strings.Split(resp.Header.Get("Location"), "/")
 	boshTaskID := locationComponents[len(locationComponents)-1]
-	log.Printf("deployment made: following bosh task %s\n", boshTaskID)
+	log.Printf("following bosh task %s\n", boshTaskID)
 	for {
 		taskState := c.GetTaskState(boshTaskID)
 		log.Printf("task state is %s\n", taskState)
 		time.Sleep(time.Second * 10)
 		switch taskState {
 		case "done":
-			return
+			return boshTaskID
 		case "error":
 			log.Fatalln("a task failed, I don't know what to do with myself!")
 		default:
 			continue
 		}
 	}
+}
+
+type InstanceGroupResponse struct {
+	Name string   `json:"job_name"`
+	IPs  []string `json:"ips"`
+}
+
+func (c *BoshClient) GetInstanceHosts(deployment string) map[string][]string {
+	req, err := http.NewRequest("GET", fmt.Sprintf("%s/deployments/%s/vms?format=full", c.boshURL, deployment), nil)
+	mustNot(err)
+	req.SetBasicAuth(c.boshAdminUsername, c.boshAdminPassword)
+	taskID := c.PerformAsyncReqestAndAwaitEndOfTask(req)
+
+	req, err = http.NewRequest("GET", fmt.Sprintf("%s/tasks/%s/output?type=result", c.boshURL, taskID), nil)
+	mustNot(err)
+	req.SetBasicAuth(c.boshAdminUsername, c.boshAdminPassword)
+	resp, err := c.httpClient.Do(req)
+	mustNot(err)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		respBytes, err := ioutil.ReadAll(resp.Body)
+		mustNot(err)
+		log.Fatalf("expected status 200, got %d. Body: %s\n", resp.StatusCode, string(respBytes))
+	}
+
+	hosts := map[string][]string{}
+	decoder := json.NewDecoder(resp.Body)
+
+	for decoder.More() {
+		var instanceGroupResp InstanceGroupResponse
+		must(decoder.Decode(&instanceGroupResp))
+		hosts[instanceGroupResp.Name] = append(hosts[instanceGroupResp.Name], instanceGroupResp.IPs...)
+	}
+	return hosts
 }
 
 func main() {
@@ -151,7 +190,8 @@ func main() {
 	boshAdminUsername := flag.String("boshAdminUsername", "", "bosh admin username")
 	boshAdminPassword := flag.String("boshAdminPassword", "", "bosh admin password")
 	thisDeployment := flag.String("thisDeployment", "", "to know bosh first you must know yourself")
-	maxInstanceCount := 4 // TODO make configurable
+	maxInstanceCount := 4          // TODO make configurable
+	redisMemoryCutoff := 2000000.0 // TODO make configurable
 	flag.Parse()
 	if *port == 0 {
 		log.Fatalln("port must be set")
@@ -178,6 +218,9 @@ func main() {
 			var manifest Manifest
 			must(yaml.Unmarshal([]byte(manifestBytes), &manifest))
 
+			hosts := boshClient.GetInstanceHosts(deployment)
+			log.Printf("bosh vms: %+v\n", hosts)
+
 			scaledDeployment := false
 			for _, instanceGroup := range manifest.InstanceGroups {
 				if instanceGroup.Instances >= maxInstanceCount {
@@ -185,10 +228,28 @@ func main() {
 					continue
 				}
 
-				// TODO use non-random criteria for scaling up
-				rando := rand.New(rand.NewSource(time.Now().UnixNano())).Float64()
-				log.Printf("rando: %f\n", rando)
-				if rando > 0.5 {
+				// TODO use non-redis-specific criteria for scaling up. This assumes every instance is a Redis!
+				totalMemory := 0.0
+				for _, host := range hosts[instanceGroup.Name] {
+					// TODO the password isn't always "password"
+					conn, err := redis.Dial("tcp", fmt.Sprintf("%s:6379", host), redis.DialPassword("password"))
+					mustNot(err)
+					memoryOutput, err := redis.String(conn.Do("INFO", "memory"))
+					mustNot(err)
+					conn.Close()
+					for _, line := range strings.Split(memoryOutput, "\n") {
+						if strings.Contains(line, "used_memory:") {
+							nodeMemory, err := strconv.Atoi(strings.Split(strings.TrimSpace(line), ":")[1])
+							mustNot(err)
+							log.Printf("memory used by %s: %d\n", host, nodeMemory)
+							totalMemory += float64(nodeMemory)
+						}
+					}
+				}
+				avgMem := totalMemory / float64(len(hosts[instanceGroup.Name]))
+				fmt.Printf("average memory used per node: %f\n", avgMem)
+
+				if avgMem > redisMemoryCutoff {
 					scaledDeployment = true
 					newInstanceCount := 2 * instanceGroup.Instances
 					log.Printf("will scale instance group %s to %d instances\n", instanceGroup.Name, newInstanceCount)
