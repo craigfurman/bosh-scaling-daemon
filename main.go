@@ -59,7 +59,31 @@ func (c *BoshClient) ListDeployments(self string) []string {
 	return deploymentNames
 }
 
+func (c *BoshClient) DownloadManifest(deploymentName string) string {
+	req, err := http.NewRequest("GET", fmt.Sprintf("%s/deployments/%s", c.boshURL, deploymentName), nil)
+	mustNot(err)
+	req.SetBasicAuth(c.boshAdminUsername, c.boshAdminPassword)
+	resp, err := c.httpClient.Do(req)
+	mustNot(err)
+
+	defer resp.Body.Close()
+	respBytes, err := ioutil.ReadAll(resp.Body)
+	mustNot(err)
+	if resp.StatusCode != http.StatusOK {
+		log.Fatalf("expected status 200, got %d. Body: %s\n", resp.StatusCode, string(respBytes))
+	}
+
+	var manifestResponse struct {
+		Manifest string `json:"manifest"`
+	}
+	must(json.Unmarshal(respBytes, &manifestResponse))
+
+	return manifestResponse.Manifest
+}
+
 func main() {
+	log.Println("*** Prepare yourself for scaling")
+
 	port := flag.Int("port", 0, "port")
 	boshURL := flag.String("boshUrl", "", "bosh url")
 	boshAdminUsername := flag.String("boshAdminUsername", "", "bosh admin username")
@@ -82,6 +106,12 @@ func main() {
 
 		deployments := boshClient.ListDeployments(*thisDeployment)
 		log.Printf("Deployments: %+v\n", deployments)
+
+		for _, deployment := range deployments {
+			log.Printf("downloading manifest for deployment: %s\n", deployment)
+			manifest := boshClient.DownloadManifest(deployment)
+			log.Println(manifest)
+		}
 
 		time.Sleep(time.Second * 10)
 	}
